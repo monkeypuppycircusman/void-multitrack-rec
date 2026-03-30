@@ -813,7 +813,7 @@ let state = {
   micAnalyser: null,
   micGainNode: null,
   mediaRecorder: null,
-  recordingChunks: [],
+  recordingChunks: [], // kept for compat but unused now
   audioCtx: null,
   masterGain: null,
   activeNodes: [],
@@ -1233,12 +1233,12 @@ function startPlayback() {
   state.activeNodes = [];
   document.getElementById('btn-play').classList.add('active');
 
+  const anySolo = state.tracks.some(t => t.solo);
   state.clips.forEach(clip => {
     const buf = state.audioBuffers[clip.fileId];
     if (!buf) return;
     const tr = state.tracks.find(t => t.id === clip.trackId);
     if (!tr || tr.muted) return;
-    const anySolo = state.tracks.some(t => t.solo);
     if (anySolo && !tr.solo) return;
 
     const clipEnd = clip.startTime + clip.duration;
@@ -1261,13 +1261,16 @@ function startPlayback() {
     }
 
     const dur = clip.duration - Math.max(0, state.playhead - clip.startTime);
-    src.start(when, offset, dur);
-    state.activeNodes.push({ src, gain: gainNode });
-    src.onended = () => { try { src.disconnect(); gainNode.disconnect(); } catch(e){} };
+    try {
+      src.start(when, offset, Math.max(0.001, dur));
+      state.activeNodes.push({ src, gain: gainNode });
+      src.onended = () => { try { src.disconnect(); gainNode.disconnect(); } catch(e){} };
+    } catch(e) {}
   });
 
+  // Always animate the playhead — even with no clips (needed during recording)
   animatePlayhead();
-  setMsg('Playing');
+  setMsg(state.recording ? 'Recording...' : 'Playing');
 }
 
 function stopPlayback(pause = false) {
@@ -1293,16 +1296,22 @@ function animatePlayhead() {
   const ac = state.audioCtx;
   state.playhead = state.startPlayhead + (ac.currentTime - state.startTime);
 
-  const maxTime = Math.max(...state.clips.map(c => c.startTime + c.duration), 10);
-  if (state.playhead > maxTime) {
-    if (state.looping) {
+  // Only auto-stop if NOT recording and we've passed all clips
+  if (!state.recording) {
+    const maxTime = state.clips.length > 0
+      ? Math.max(...state.clips.map(c => c.startTime + c.duration))
+      : 0;
+    const stopAt = Math.max(maxTime, state.startPlayhead + 0.5);
+    if (state.clips.length > 0 && state.playhead > maxTime) {
+      if (state.looping) {
+        stopPlayback(false);
+        state.playhead = state.loopStart;
+        startPlayback();
+        return;
+      }
       stopPlayback(false);
-      state.playhead = state.loopStart;
-      startPlayback();
       return;
     }
-    stopPlayback(false);
-    return;
   }
 
   updatePlayhead();
@@ -1328,54 +1337,99 @@ function updateTimeDisplay() {
   document.getElementById('st-cursor').textContent = formatTime(state.playhead);
 }
 
-// ── Recording ──
-async function startRecording() {
+// ── Recording — raw PCM via ScriptProcessor ──
+// Captures Float32 samples directly from AudioContext — no MediaRecorder/decodeAudioData needed.
+// Works in Chrome, Firefox, Safari, Edge on any OS.
+
+let _recPCM = [];        // Float32Array chunks
+let _recNode = null;     // ScriptProcessorNode
+let _recMicSrc = null;   // MediaStreamAudioSourceNode
+let _recSR = 44100;      // sample rate (set at record time)
+let _recTrackId = null;
+let _recStart = 0;
+
+function startRecording() {
   if (state.recording) return;
+
   const armedTrack = state.tracks.find(t => t.armed);
-  if (!armedTrack) { setMsg('No track armed — click R on a track'); return; }
-  if (!state.micStream) { setMsg('No mic — go to MIC tab and init first'); return; }
+  if (!armedTrack) { setMsg('ARM a track first — click R on a track header'); return; }
+  if (!state.micStream) { setMsg('No mic — MIC tab → Init Mic Input first'); return; }
 
-  ensureAudioCtx();
-  state.recordingChunks = [];
-  const options = { mimeType: 'audio/webm;codecs=opus' };
-  try {
-    state.mediaRecorder = new MediaRecorder(state.micStream, options);
-  } catch(e) {
-    try { state.mediaRecorder = new MediaRecorder(state.micStream); } catch(e2) { setMsg('Recording not supported'); return; }
-  }
-  state.mediaRecorder.ondataavailable = e => { if (e.data.size > 0) state.recordingChunks.push(e.data); };
-  state.mediaRecorder.onstop = async () => { await finishRecording(armedTrack); };
-  state.mediaRecorder.start(100);
-  state.recording = true;
-  state.recStart = state.playhead;
-  document.getElementById('btn-rec').classList.add('active');
-  if (!state.playing) startPlayback();
-  setMsg('Recording...');
-}
-
-async function finishRecording(track) {
-  const blob = new Blob(state.recordingChunks, { type: 'audio/webm' });
-  const arrayBuf = await blob.arrayBuffer();
   const ac = ensureAudioCtx();
-  let audioBuf;
-  try { audioBuf = await ac.decodeAudioData(arrayBuf); }
-  catch(e) { setMsg('Could not decode recording'); return; }
+  _recSR = ac.sampleRate;
+  _recPCM = [];
+  _recTrackId = armedTrack.id;
+  _recStart = state.playhead;
 
-  const fileId = ++state.fileIdCtr;
-  const name = `REC-${track.name}-${Date.now()}`;
-  state.audioBuffers[fileId] = audioBuf;
-  state.files.push({ id: fileId, name, duration: audioBuf.duration });
-  addClipToTrack(track, fileId, name, audioBuf.duration, state.recStart);
-  renderFileList();
-  drawTimeline();
-  setMsg(`Recorded "${name}" — ${audioBuf.duration.toFixed(2)}s`);
+  // Create a fresh MediaStreamSource each time (reusing causes silence in some browsers)
+  _recMicSrc = ac.createMediaStreamSource(state.micStream);
+
+  // ScriptProcessorNode: bufferSize 4096, 1 input channel, 1 output channel
+  _recNode = ac.createScriptProcessor(4096, 1, 1);
+  _recNode.onaudioprocess = ev => {
+    if (!state.recording) return;
+    const ch = ev.inputBuffer.getChannelData(0);
+    _recPCM.push(new Float32Array(ch)); // copy — buffer is recycled
+  };
+
+  // Must connect output to destination or onaudioprocess won't fire in Chrome
+  _recMicSrc.connect(_recNode);
+  _recNode.connect(ac.destination);
+
+  state.recording = true;
+  document.getElementById('btn-rec').classList.add('active');
+
+  if (!state.playing) startPlayback();
+  setMsg(`⏺ Recording "${armedTrack.name}"... press ■ STOP or ⏺ again`);
 }
 
 function stopRecording() {
   if (!state.recording) return;
   state.recording = false;
   document.getElementById('btn-rec').classList.remove('active');
-  if (state.mediaRecorder && state.mediaRecorder.state !== 'inactive') state.mediaRecorder.stop();
+
+  // Disconnect nodes before reading data
+  try { _recNode.disconnect(); } catch(e) {}
+  try { _recMicSrc.disconnect(); } catch(e) {}
+  _recNode.onaudioprocess = null;
+  _recNode = null;
+  _recMicSrc = null;
+
+  finishRecording();
+}
+
+function finishRecording() {
+  const track = state.tracks.find(t => t.id === _recTrackId);
+  if (!track) { setMsg('Recorded track missing'); return; }
+  if (_recPCM.length === 0) { setMsg('Nothing captured — mic might be blocked'); return; }
+
+  // Merge chunks
+  const total = _recPCM.reduce((s, c) => s + c.length, 0);
+  if (total < 512) { setMsg('Recording too short'); return; }
+
+  const merged = new Float32Array(total);
+  let off = 0;
+  for (const chunk of _recPCM) { merged.set(chunk, off); off += chunk.length; }
+  _recPCM = [];
+
+  // Build AudioBuffer directly — no codec decode at all
+  const ac = ensureAudioCtx();
+  const audioBuf = ac.createBuffer(1, merged.length, _recSR);
+  audioBuf.copyToChannel(merged, 0);
+
+  const dur = audioBuf.duration;
+  const fileId = ++state.fileIdCtr;
+  const ts = new Date().toISOString().slice(11, 19).replace(/:/g, '');
+  const name = `REC_${track.name}_${ts}`;
+
+  state.audioBuffers[fileId] = audioBuf;
+  state.files.push({ id: fileId, name, duration: dur });
+
+  addClipToTrack(track, fileId, name, dur, _recStart);
+  renderFileList();
+  drawTimeline();
+  updateStatus();
+  setMsg(`✓ Recorded "${name}" — ${dur.toFixed(2)}s`);
 }
 
 // ── Clip management ──
@@ -1759,7 +1813,10 @@ document.getElementById('ctx-delete').addEventListener('click', () => {
 document.getElementById('btn-play').addEventListener('click', () => {
   if (state.playing) stopPlayback(true); else startPlayback();
 });
-document.getElementById('btn-stop').addEventListener('click', () => stopPlayback(false));
+document.getElementById('btn-stop').addEventListener('click', () => {
+  if (state.recording) stopRecording();
+  stopPlayback(false);
+});
 document.getElementById('btn-rewind').addEventListener('click', () => {
   stopPlayback(false);
   state.playhead = 0;
@@ -2049,7 +2106,11 @@ window.addEventListener('keydown', e => {
   if (e.key === 'r' || e.key === 'R') { if (state.recording) stopRecording(); else startRecording(); }
   if (e.key === 's' || e.key === 'S') {
     if (e.ctrlKey) { e.preventDefault(); saveProject(); }
-    else { stopPlayback(false); if (state.selectedClip) splitClip(state.selectedClip, state.playhead); }
+    else {
+      if (state.recording) stopRecording();
+      stopPlayback(false);
+      if (state.selectedClip) splitClip(state.selectedClip, state.playhead);
+    }
   }
   if (e.key === 'Home') { stopPlayback(false); state.playhead = 0; updatePlayhead(); updateTimeDisplay(); }
   if (e.key === 'Delete' && state.selectedClip) deleteClip(state.selectedClip);
